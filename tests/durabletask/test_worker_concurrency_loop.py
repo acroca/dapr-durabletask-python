@@ -2,7 +2,7 @@ import asyncio
 import threading
 import time
 
-from durabletask.worker import ConcurrencyOptions, TaskHubGrpcWorker
+from durabletask.worker import TaskHubGrpcWorker
 
 
 class DummyStub:
@@ -41,12 +41,7 @@ class DummyCompletionToken:
 
 
 def test_worker_concurrency_loop_sync():
-    options = ConcurrencyOptions(
-        maximum_concurrent_activity_work_items=2,
-        maximum_concurrent_orchestration_work_items=1,
-        maximum_thread_pool_workers=2,
-    )
-    worker = TaskHubGrpcWorker(concurrency_options=options)
+    worker = TaskHubGrpcWorker()
     stub = DummyStub()
 
     def dummy_orchestrator(req, stub, completionToken):
@@ -102,13 +97,7 @@ def dummy_activity(ctx, input):
 
 
 def test_worker_concurrency_sync():
-    # Use small concurrency to make test observable
-    options = ConcurrencyOptions(
-        maximum_concurrent_activity_work_items=2,
-        maximum_concurrent_orchestration_work_items=2,
-        maximum_thread_pool_workers=2,
-    )
-    worker = TaskHubGrpcWorker(concurrency_options=options)
+    worker = TaskHubGrpcWorker()
     worker.add_orchestrator(dummy_orchestrator)
     worker.add_activity(dummy_activity)
 

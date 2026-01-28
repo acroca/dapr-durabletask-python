@@ -4,10 +4,7 @@
 import asyncio
 import inspect
 import logging
-import os
 import random
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Event, Thread
 from types import GeneratorType
@@ -28,65 +25,6 @@ TOutput = TypeVar("TOutput")
 
 class VersionNotRegisteredException(Exception):
     pass
-
-def _log_all_threads(logger: logging.Logger, context: str = ""):
-    """Helper function to log all currently active threads for debugging."""
-    active_threads = threading.enumerate()
-    thread_info = []
-    for t in active_threads:
-        thread_info.append(
-            f"name='{t.name}', id={t.ident}, daemon={t.daemon}, alive={t.is_alive()}"
-        )
-    logger.debug(
-        f"[THREAD_TRACE] {context} Active threads ({len(active_threads)}): {', '.join(thread_info)}"
-    )
-
-
-class ConcurrencyOptions:
-    """Configuration options for controlling concurrency of different work item types and the thread pool size.
-
-    This class provides fine-grained control over concurrent processing limits for
-    activities, orchestrations and the thread pool size.
-    """
-
-    def __init__(
-        self,
-        maximum_concurrent_activity_work_items: Optional[int] = None,
-        maximum_concurrent_orchestration_work_items: Optional[int] = None,
-        maximum_thread_pool_workers: Optional[int] = None,
-    ):
-        """Initialize concurrency options.
-
-        Args:
-            maximum_concurrent_activity_work_items: Maximum number of activity work items
-                that can be processed concurrently. Defaults to 100 * processor_count.
-            maximum_concurrent_orchestration_work_items: Maximum number of orchestration work items
-                that can be processed concurrently. Defaults to 100 * processor_count.
-            maximum_thread_pool_workers: Maximum number of thread pool workers to use.
-        """
-        processor_count = os.cpu_count() or 1
-        default_concurrency = 100 * processor_count
-        # see https://docs.python.org/3/library/concurrent.futures.html
-        default_max_workers = processor_count + 4
-
-        self.maximum_concurrent_activity_work_items = (
-            maximum_concurrent_activity_work_items
-            if maximum_concurrent_activity_work_items is not None
-            else default_concurrency
-        )
-
-        self.maximum_concurrent_orchestration_work_items = (
-            maximum_concurrent_orchestration_work_items
-            if maximum_concurrent_orchestration_work_items is not None
-            else default_concurrency
-        )
-
-        self.maximum_thread_pool_workers = (
-            maximum_thread_pool_workers
-            if maximum_thread_pool_workers is not None
-            else default_max_workers
-        )
-
 
 class _Registry:
     orchestrators: dict[str, task.Orchestrator]
@@ -181,7 +119,7 @@ class TaskHubGrpcWorker:
 
     This worker connects to a Durable Task backend service via gRPC to receive and process
     work items including orchestration functions and activity functions. It provides
-    concurrent execution capabilities with configurable limits and automatic retry handling.
+    concurrent execution capabilities and automatic retry handling.
 
     The worker manages the complete lifecycle:
     - Registers orchestrator and activity functions
@@ -202,27 +140,16 @@ class TaskHubGrpcWorker:
             Defaults to False.
         interceptors (Optional[Sequence[shared.ClientInterceptor]], optional): Custom gRPC
             interceptors to apply to the channel. Defaults to None.
-        concurrency_options (Optional[ConcurrencyOptions], optional): Configuration for
-            controlling worker concurrency limits. If None, default settings are used.
         stop_timeout (float, optional): Maximum time in seconds to wait for the worker thread
             to stop when calling stop(). Defaults to 30.0. Useful to set lower values in tests.
-
-    Attributes:
-        concurrency_options (ConcurrencyOptions): The current concurrency configuration.
 
     Example:
         Basic worker setup:
 
-        >>> from durabletask.worker import TaskHubGrpcWorker, ConcurrencyOptions
+        >>> from durabletask.worker import TaskHubGrpcWorker
         >>>
-        >>> # Create worker with custom concurrency settings
-        >>> concurrency = ConcurrencyOptions(
-        ...     maximum_concurrent_activity_work_items=50,
-        ...     maximum_concurrent_orchestration_work_items=20
-        ... )
         >>> worker = TaskHubGrpcWorker(
         ...     host_address="localhost:4001",
-        ...     concurrency_options=concurrency
         ... )
         >>>
         >>> # Register functions
@@ -269,7 +196,6 @@ class TaskHubGrpcWorker:
         log_formatter: Optional[logging.Formatter] = None,
         secure_channel: bool = False,
         interceptors: Optional[Sequence[shared.ClientInterceptor]] = None,
-        concurrency_options: Optional[ConcurrencyOptions] = None,
         channel_options: Optional[Sequence[tuple[str, Any]]] = None,
         stop_timeout: float = 30.0,
     ):
@@ -283,11 +209,6 @@ class TaskHubGrpcWorker:
         self._stop_timeout = stop_timeout
         self._current_channel: Optional[grpc.Channel] = None  # Store channel reference for cleanup
 
-        # Use provided concurrency options or create default ones
-        self._concurrency_options = (
-            concurrency_options if concurrency_options is not None else ConcurrencyOptions()
-        )
-
         # Determine the interceptors to use
         if interceptors is not None:
             self._interceptors = list(interceptors)
@@ -298,12 +219,7 @@ class TaskHubGrpcWorker:
         else:
             self._interceptors = None
 
-        self._async_worker_manager = _AsyncWorkerManager(self._concurrency_options)
-
-    @property
-    def concurrency_options(self) -> ConcurrencyOptions:
-        """Get the current concurrency options for this worker."""
-        return self._concurrency_options
+        self._async_worker_manager = _AsyncWorkerManager()
 
     def __enter__(self):
         return self
@@ -442,10 +358,7 @@ class TaskHubGrpcWorker:
             try:
                 assert current_stub is not None
                 stub = current_stub
-                get_work_items_request = pb.GetWorkItemsRequest(
-                    maxConcurrentOrchestrationWorkItems=self._concurrency_options.maximum_concurrent_orchestration_work_items,
-                    maxConcurrentActivityWorkItems=self._concurrency_options.maximum_concurrent_activity_work_items,
-                )
+                get_work_items_request = pb.GetWorkItemsRequest()
                 self._response_stream = stub.GetWorkItems(get_work_items_request)
                 self._logger.info(
                     f"Successfully connected to {self._host_address}. Waiting for work items..."
@@ -1693,10 +1606,7 @@ def _is_suspendable(event: pb.HistoryEvent) -> bool:
 
 
 class _AsyncWorkerManager:
-    def __init__(self, concurrency_options: ConcurrencyOptions):
-        self.concurrency_options = concurrency_options
-        self.activity_semaphore = None
-        self.orchestration_semaphore = None
+    def __init__(self):
         # Don't create queues here - defer until we have an event loop
         self.activity_queue: Optional[asyncio.Queue] = None
         self.orchestration_queue: Optional[asyncio.Queue] = None
@@ -1704,10 +1614,6 @@ class _AsyncWorkerManager:
         # Store work items when no event loop is available
         self._pending_activity_work: list = []
         self._pending_orchestration_work: list = []
-        self.thread_pool = ThreadPoolExecutor(
-            max_workers=concurrency_options.maximum_thread_pool_workers,
-            thread_name_prefix="DurableTask",
-        )
         self._shutdown = False
 
     def _ensure_queues_for_current_loop(self):
@@ -1773,22 +1679,14 @@ class _AsyncWorkerManager:
         # Ensure queues are properly bound to the current event loop
         self._ensure_queues_for_current_loop()
 
-        # Create semaphores in the current event loop
-        self.activity_semaphore = asyncio.Semaphore(
-            self.concurrency_options.maximum_concurrent_activity_work_items
-        )
-        self.orchestration_semaphore = asyncio.Semaphore(
-            self.concurrency_options.maximum_concurrent_orchestration_work_items
-        )
-
         # Start background consumers for each work type
         if self.activity_queue is not None and self.orchestration_queue is not None:
             await asyncio.gather(
-                self._consume_queue(self.activity_queue, self.activity_semaphore),
-                self._consume_queue(self.orchestration_queue, self.orchestration_semaphore),
+                self._consume_queue(self.activity_queue),
+                self._consume_queue(self.orchestration_queue),
             )
 
-    async def _consume_queue(self, queue: asyncio.Queue, semaphore: asyncio.Semaphore):
+    async def _consume_queue(self, queue: asyncio.Queue):
         # List to track running tasks
         running_tasks: set[asyncio.Task] = set()
 
@@ -1816,7 +1714,7 @@ class _AsyncWorkerManager:
                 func, args, kwargs = work
                 # Create a concurrent task for processing
                 task = asyncio.create_task(
-                    self._process_work_item(semaphore, queue, func, args, kwargs)
+                    self._process_work_item(queue, func, args, kwargs)
                 )
                 running_tasks.add(task)
         # handle the cancellation bubbled up from the loop
@@ -1831,28 +1729,35 @@ class _AsyncWorkerManager:
             raise
 
     async def _process_work_item(
-        self, semaphore: asyncio.Semaphore, queue: asyncio.Queue, func, args, kwargs
+        self, queue: asyncio.Queue, func, args, kwargs
     ):
-        async with semaphore:
-            try:
-                await self._run_func(func, *args, **kwargs)
-            finally:
-                queue.task_done()
+        try:
+            await self._run_func(func, *args, **kwargs)
+        finally:
+            queue.task_done()
 
     async def _run_func(self, func, *args, **kwargs):
         if inspect.iscoroutinefunction(func):
             return await func(*args, **kwargs)
         else:
             loop = asyncio.get_running_loop()
+
             # Avoid submitting to executor after shutdown
-            if (
-                getattr(self, "_shutdown", False)
-                and getattr(self, "thread_pool", None)
-                and getattr(self.thread_pool, "_shutdown", False)
-            ):
+            if self._shutdown:
                 return None
-            result = await loop.run_in_executor(self.thread_pool, lambda: func(*args, **kwargs))
-            return result
+
+            future = loop.create_future()
+
+            def run_sync():
+                try:
+                    result = func(*args, **kwargs)
+                except Exception as ex:
+                    loop.call_soon_threadsafe(future.set_exception, ex)
+                else:
+                    loop.call_soon_threadsafe(future.set_result, result)
+
+            Thread(target=run_sync, name="DurableTaskSyncWorkItem", daemon=True).start()
+            return await future
 
     def submit_activity(self, func, *args, **kwargs):
         work_item = (func, args, kwargs)
@@ -1874,11 +1779,6 @@ class _AsyncWorkerManager:
 
     def shutdown(self):
         self._shutdown = True
-        # Shutdown thread pool. Since we've already cancelled worker_task and set _shutdown=True,
-        # no new work should be submitted and existing work should complete quickly.
-        # ThreadPoolExecutor.shutdown(wait=True) doesn't support a timeout, but with proper
-        # cancellation in place, threads should exit promptly, otherwise this will hang and block shutdown for the application.
-        self.thread_pool.shutdown(wait=True)
 
     def reset_for_new_run(self):
         """Reset the manager state for a new run."""
@@ -1904,4 +1804,4 @@ class _AsyncWorkerManager:
 
 
 # Export public API
-__all__ = ["ConcurrencyOptions", "TaskHubGrpcWorker"]
+__all__ = ["TaskHubGrpcWorker"]
