@@ -5,10 +5,8 @@ import asyncio
 import contextlib
 import inspect
 import logging
-import os
 import random
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Event, Thread
 from types import GeneratorType
@@ -54,52 +52,6 @@ def _log_all_threads(logger: logging.Logger, context: str = ""):
     logger.debug(
         f"[THREAD_TRACE] {context} Active threads ({len(active_threads)}): {', '.join(thread_info)}"
     )
-
-
-class ConcurrencyOptions:
-    """Configuration options for controlling concurrency of different work item types and the thread pool size.
-
-    This class provides fine-grained control over concurrent processing limits for
-    activities, orchestrations and the thread pool size.
-    """
-
-    def __init__(
-        self,
-        maximum_concurrent_activity_work_items: Optional[int] = None,
-        maximum_concurrent_orchestration_work_items: Optional[int] = None,
-        maximum_thread_pool_workers: Optional[int] = None,
-    ):
-        """Initialize concurrency options.
-
-        Args:
-            maximum_concurrent_activity_work_items: Maximum number of activity work items
-                that can be processed concurrently. Defaults to 100 * processor_count.
-            maximum_concurrent_orchestration_work_items: Maximum number of orchestration work items
-                that can be processed concurrently. Defaults to 100 * processor_count.
-            maximum_thread_pool_workers: Maximum number of thread pool workers to use.
-        """
-        processor_count = os.cpu_count() or 1
-        default_concurrency = 100 * processor_count
-        # see https://docs.python.org/3/library/concurrent.futures.html
-        default_max_workers = processor_count + 4
-
-        self.maximum_concurrent_activity_work_items = (
-            maximum_concurrent_activity_work_items
-            if maximum_concurrent_activity_work_items is not None
-            else default_concurrency
-        )
-
-        self.maximum_concurrent_orchestration_work_items = (
-            maximum_concurrent_orchestration_work_items
-            if maximum_concurrent_orchestration_work_items is not None
-            else default_concurrency
-        )
-
-        self.maximum_thread_pool_workers = (
-            maximum_thread_pool_workers
-            if maximum_thread_pool_workers is not None
-            else default_max_workers
-        )
 
 
 class _Registry:
@@ -206,8 +158,9 @@ class TaskHubGrpcWorker:
     """A gRPC-based worker for processing durable task orchestrations and activities.
 
     This worker connects to a Durable Task backend service via gRPC to receive and process
-    work items including orchestration functions and activity functions. It provides
-    concurrent execution capabilities with configurable limits and automatic retry handling.
+    work items including orchestration functions and activity functions. Each work item runs
+    immediately in its own asyncio task with no concurrency limits, mirroring the Go SDK's
+    goroutine-per-work-item model.
 
     The worker manages the complete lifecycle:
     - Registers orchestrator and activity functions
@@ -228,28 +181,15 @@ class TaskHubGrpcWorker:
             Defaults to False.
         interceptors (Optional[Sequence[shared.ClientInterceptor]], optional): Custom gRPC
             interceptors to apply to the channel. Defaults to None.
-        concurrency_options (Optional[ConcurrencyOptions], optional): Configuration for
-            controlling worker concurrency limits. If None, default settings are used.
         stop_timeout (float, optional): Maximum time in seconds to wait for the worker thread
             to stop when calling stop(). Defaults to 30.0. Useful to set lower values in tests.
-
-    Attributes:
-        concurrency_options (ConcurrencyOptions): The current concurrency configuration.
 
     Example:
         Basic worker setup:
 
-        >>> from durabletask.worker import TaskHubGrpcWorker, ConcurrencyOptions
+        >>> from durabletask.worker import TaskHubGrpcWorker
         >>>
-        >>> # Create worker with custom concurrency settings
-        >>> concurrency = ConcurrencyOptions(
-        ...     maximum_concurrent_activity_work_items=50,
-        ...     maximum_concurrent_orchestration_work_items=20
-        ... )
-        >>> worker = TaskHubGrpcWorker(
-        ...     host_address="localhost:4001",
-        ...     concurrency_options=concurrency
-        ... )
+        >>> worker = TaskHubGrpcWorker(host_address="localhost:4001")
         >>>
         >>> # Register functions
         >>> @worker.add_orchestrator
@@ -295,7 +235,6 @@ class TaskHubGrpcWorker:
         log_formatter: Optional[logging.Formatter] = None,
         secure_channel: bool = False,
         interceptors: Optional[Sequence[shared.ClientInterceptor]] = None,
-        concurrency_options: Optional[ConcurrencyOptions] = None,
         channel_options: Optional[Sequence[tuple[str, Any]]] = None,
         stop_timeout: float = 30.0,
     ):
@@ -309,10 +248,6 @@ class TaskHubGrpcWorker:
         self._stop_timeout = stop_timeout
         self._current_channel: Optional[grpc.Channel] = None  # Store channel reference for cleanup
         self._stream_ready = threading.Event()
-        # Use provided concurrency options or create default ones
-        self._concurrency_options = (
-            concurrency_options if concurrency_options is not None else ConcurrencyOptions()
-        )
 
         # Determine the interceptors to use
         if interceptors is not None:
@@ -324,12 +259,7 @@ class TaskHubGrpcWorker:
         else:
             self._interceptors = None
 
-        self._async_worker_manager = _AsyncWorkerManager(self._concurrency_options, self._logger)
-
-    @property
-    def concurrency_options(self) -> ConcurrencyOptions:
-        """Get the current concurrency options for this worker."""
-        return self._concurrency_options
+        self._async_worker_manager = _AsyncWorkerManager(self._logger)
 
     def __enter__(self):
         return self
@@ -473,10 +403,7 @@ class TaskHubGrpcWorker:
             try:
                 assert current_stub is not None
                 stub = current_stub
-                get_work_items_request = pb.GetWorkItemsRequest(
-                    maxConcurrentOrchestrationWorkItems=self._concurrency_options.maximum_concurrent_orchestration_work_items,
-                    maxConcurrentActivityWorkItems=self._concurrency_options.maximum_concurrent_activity_work_items,
-                )
+                get_work_items_request = pb.GetWorkItemsRequest()
                 try:
                     self._response_stream = stub.GetWorkItems(get_work_items_request)
                     self._logger.info(
@@ -1763,219 +1690,122 @@ def _is_suspendable(event: pb.HistoryEvent) -> bool:
 
 
 class _AsyncWorkerManager:
-    def __init__(self, concurrency_options: ConcurrencyOptions, logger: logging.Logger):
-        self.concurrency_options = concurrency_options
-        self.activity_semaphore = None
-        self.orchestration_semaphore = None
-        # Don't create queues here - defer until we have an event loop
-        self.activity_queue: Optional[asyncio.Queue] = None
-        self.orchestration_queue: Optional[asyncio.Queue] = None
-        self._queue_event_loop: Optional[asyncio.AbstractEventLoop] = None
-        # Store work items when no event loop is available
-        self._pending_activity_work: list = []
-        self._pending_orchestration_work: list = []
-        self.thread_pool = ThreadPoolExecutor(
-            max_workers=concurrency_options.maximum_thread_pool_workers,
-            thread_name_prefix="DurableTask",
-        )
+    """Manages concurrent execution of activity and orchestration work items.
+
+    Mirrors the Go SDK pattern: each work item runs immediately in its own
+    asyncio task with no concurrency limits. Synchronous functions are run in
+    a dedicated thread per work item (bypassing the default executor pool) so
+    all work items start immediately, just like goroutines.
+    """
+
+    def __init__(self, logger: logging.Logger):
         self._shutdown = False
         self._logger = logger
-
-    def _ensure_queues_for_current_loop(self):
-        """Ensure queues are bound to the current event loop."""
-        try:
-            current_loop = asyncio.get_running_loop()
-            if current_loop.is_closed():
-                return
-        except RuntimeError as e:
-            self._logger.exception(f"Failed to get event loop {e}")
-            # No event loop running, can't create queues
-            return
-
-        # Check if queues are already properly set up for current loop
-        if self._queue_event_loop is current_loop:
-            if self.activity_queue is not None and self.orchestration_queue is not None:
-                # Queues are already bound to the current loop and exist
-                return
-
-        # Need to recreate queues for the current event loop
-        # First, preserve any existing work items
-        existing_activity_items = []
-        existing_orchestration_items = []
-
-        if self.activity_queue is not None:
-            try:
-                while not self.activity_queue.empty():
-                    existing_activity_items.append(self.activity_queue.get_nowait())
-            except Exception as e:
-                self._logger.debug(f"Failed to append to the activity queue {e}")
-                pass
-
-        if self.orchestration_queue is not None:
-            try:
-                while not self.orchestration_queue.empty():
-                    existing_orchestration_items.append(self.orchestration_queue.get_nowait())
-            except Exception as e:
-                self._logger.debug(f"Failed to append to the orchestration queue {e}")
-                pass
-
-        # Create fresh queues for the current event loop
-        self.activity_queue = asyncio.Queue()
-        self.orchestration_queue = asyncio.Queue()
-        self._queue_event_loop = current_loop
-
-        # Restore the work items to the new queues
-        for item in existing_activity_items:
-            self.activity_queue.put_nowait(item)
-        for item in existing_orchestration_items:
-            self.orchestration_queue.put_nowait(item)
-
-        # Move pending work items to the queues
-        for item in self._pending_activity_work:
-            self.activity_queue.put_nowait(item)
-        for item in self._pending_orchestration_work:
-            self.orchestration_queue.put_nowait(item)
-
-        # Clear the pending work lists
-        self._pending_activity_work.clear()
-        self._pending_orchestration_work.clear()
+        self._running_tasks: set[asyncio.Task] = set()
+        # Buffer for work items submitted before run() starts the event loop
+        self._pending_work: list[tuple] = []
 
     async def run(self):
-        # Reset shutdown flag in case this manager is being reused
+        """Run until shutdown, draining any buffered work items on start."""
         self._shutdown = False
 
-        # Ensure queues are properly bound to the current event loop
-        self._ensure_queues_for_current_loop()
-
-        # Create semaphores in the current event loop
-        self.activity_semaphore = asyncio.Semaphore(
-            self.concurrency_options.maximum_concurrent_activity_work_items
-        )
-        self.orchestration_semaphore = asyncio.Semaphore(
-            self.concurrency_options.maximum_concurrent_orchestration_work_items
-        )
-
-        # Start background consumers for each work type
-        if self.activity_queue is not None and self.orchestration_queue is not None:
-            await asyncio.gather(
-                self._consume_queue(self.activity_queue, self.activity_semaphore),
-                self._consume_queue(self.orchestration_queue, self.orchestration_semaphore),
-            )
-
-    async def _consume_queue(self, queue: asyncio.Queue, semaphore: asyncio.Semaphore):
-        # List to track running tasks
-        running_tasks: set[asyncio.Task] = set()
+        # Drain any work items that were submitted before run() started
+        for func, args, kwargs in self._pending_work:
+            self._create_work_task(func, args, kwargs)
+        self._pending_work.clear()
 
         try:
-            while True:
-                # Clean up completed tasks
-                done_tasks = {task for task in running_tasks if task.done()}
-                running_tasks -= done_tasks
-
-                # Exit if shutdown is set and the queue is empty and no tasks are running
-                if self._shutdown and queue.empty() and not running_tasks:
-                    break
-
-                try:
-                    work = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    # Check for cancellation during timeout and exit while loop if shutting down
-                    if self._shutdown:
-                        break
-                    continue  # otherwise wait for work item to become available and loop again
-                except asyncio.CancelledError:
-                    # Propagate cancellation
-                    raise
-
-                func, args, kwargs = work
-                # Create a concurrent task for processing
-                task = asyncio.create_task(
-                    self._process_work_item(semaphore, queue, func, args, kwargs)
-                )
-                running_tasks.add(task)
-        # handle the cancellation bubbled up from the loop
+            while not self._shutdown:
+                # Periodically clean up completed task references
+                done_tasks = {t for t in self._running_tasks if t.done()}
+                self._running_tasks -= done_tasks
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError:
-            # Cancel any remaining running tasks
-            for task in running_tasks:
-                if not task.done():
-                    task.cancel()
-            # Wait briefly for tasks to cancel, but don't block indefinitely
-            if running_tasks:
-                await asyncio.gather(*running_tasks, return_exceptions=True)
+            # Cancel all running tasks and wait for them to finish
+            for t in self._running_tasks:
+                if not t.done():
+                    t.cancel()
+            if self._running_tasks:
+                await asyncio.gather(*self._running_tasks, return_exceptions=True)
+            self._running_tasks.clear()
             raise
 
-    async def _process_work_item(
-        self, semaphore: asyncio.Semaphore, queue: asyncio.Queue, func, args, kwargs
-    ):
-        async with semaphore:
-            try:
-                await self._run_func(func, *args, **kwargs)
-            finally:
-                queue.task_done()
+    def _create_work_task(self, func, args, kwargs):
+        """Create an asyncio task for a work item and track it."""
+        t = asyncio.create_task(self._run_work_item(func, *args, **kwargs))
+        self._running_tasks.add(t)
+        t.add_done_callback(self._running_tasks.discard)
 
-    async def _run_func(self, func, *args, **kwargs):
-        if inspect.iscoroutinefunction(func):
-            return await func(*args, **kwargs)
-        else:
-            loop = asyncio.get_running_loop()
-            # Avoid submitting to executor after shutdown
-            if (
-                getattr(self, "_shutdown", False)
-                and getattr(self, "thread_pool", None)
-                and getattr(self.thread_pool, "_shutdown", False)
-            ):
-                return None
-            result = await loop.run_in_executor(self.thread_pool, lambda: func(*args, **kwargs))
-            return result
+    async def _run_work_item(self, func, *args, **kwargs):
+        """Run a single work item.
+
+        Async functions are awaited directly. Sync functions are each run in
+        their own dedicated thread (not the default executor pool) so there is
+        no upper bound on how many can execute concurrently.
+        """
+        try:
+            if inspect.iscoroutinefunction(func):
+                return await func(*args, **kwargs)
+            else:
+                return await self._run_in_thread(func, *args, **kwargs)
+        except Exception as e:
+            self._logger.exception(f"Error running work item: {e}")
+
+    @staticmethod
+    async def _run_in_thread(func, *args, **kwargs):
+        """Run a sync function in its own dedicated thread, bypassing any thread pool.
+
+        Unlike asyncio.to_thread() which is limited by the default executor's
+        pool size, this spawns a fresh thread for every call so all work items
+        can start immediately -- matching Go's goroutine-per-activity model.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        def run():
+            try:
+                result = func(*args, **kwargs)
+            except BaseException as exc:
+                loop.call_soon_threadsafe(_safe_set_future_exception, future, exc)
+            else:
+                loop.call_soon_threadsafe(_safe_set_future_result, future, result)
+
+        threading.Thread(target=run).start()
+        return await future
 
     def submit_activity(self, func, *args, **kwargs):
-        work_item = (func, args, kwargs)
-        self._ensure_queues_for_current_loop()
-        if self.activity_queue is not None:
-            self.activity_queue.put_nowait(work_item)
-        else:
-            # No event loop running, store in pending list
-            self._pending_activity_work.append(work_item)
+        """Submit an activity to run immediately as its own asyncio task."""
+        try:
+            asyncio.get_running_loop()
+            self._create_work_task(func, args, kwargs)
+        except RuntimeError:
+            # No event loop running yet; buffer for when run() starts
+            self._pending_work.append((func, args, kwargs))
 
     def submit_orchestration(self, func, *args, **kwargs):
-        work_item = (func, args, kwargs)
-        self._ensure_queues_for_current_loop()
-        if self.orchestration_queue is not None:
-            self.orchestration_queue.put_nowait(work_item)
-        else:
-            # No event loop running, store in pending list
-            self._pending_orchestration_work.append(work_item)
+        """Submit an orchestration to run immediately as its own asyncio task."""
+        try:
+            asyncio.get_running_loop()
+            self._create_work_task(func, args, kwargs)
+        except RuntimeError:
+            # No event loop running yet; buffer for when run() starts
+            self._pending_work.append((func, args, kwargs))
 
     def shutdown(self):
         self._shutdown = True
-        # Shutdown thread pool. Since we've already cancelled worker_task and set _shutdown=True,
-        # no new work should be submitted and existing work should complete quickly.
-        # ThreadPoolExecutor.shutdown(wait=True) doesn't support a timeout, but with proper
-        # cancellation in place, threads should exit promptly, otherwise this will hang and block shutdown for the application.
-        self.thread_pool.shutdown(wait=True)
 
-    def reset_for_new_run(self):
-        """Reset the manager state for a new run."""
-        self._shutdown = False
-        # Clear any existing queues - they'll be recreated when needed
-        if self.activity_queue is not None:
-            # Clear existing queue by creating a new one
-            # This ensures no items from previous runs remain
-            try:
-                while not self.activity_queue.empty():
-                    self.activity_queue.get_nowait()
-            except Exception:
-                pass
-        if self.orchestration_queue is not None:
-            try:
-                while not self.orchestration_queue.empty():
-                    self.orchestration_queue.get_nowait()
-            except Exception:
-                pass
-        # Clear pending work lists
-        self._pending_activity_work.clear()
-        self._pending_orchestration_work.clear()
+
+def _safe_set_future_result(future: asyncio.Future, result):
+    """Set result on a future, ignoring if it's already done (e.g. cancelled)."""
+    if not future.done():
+        future.set_result(result)
+
+
+def _safe_set_future_exception(future: asyncio.Future, exc: BaseException):
+    """Set exception on a future, ignoring if it's already done (e.g. cancelled)."""
+    if not future.done():
+        future.set_exception(exc)
 
 
 # Export public API
-__all__ = ["ConcurrencyOptions", "TaskHubGrpcWorker"]
+__all__ = ["TaskHubGrpcWorker"]

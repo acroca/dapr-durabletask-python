@@ -2,7 +2,7 @@ import asyncio
 import threading
 import time
 
-from durabletask.worker import ConcurrencyOptions, TaskHubGrpcWorker
+from durabletask.worker import TaskHubGrpcWorker
 
 
 class DummyStub:
@@ -41,12 +41,7 @@ class DummyCompletionToken:
 
 
 def test_worker_concurrency_loop_sync():
-    options = ConcurrencyOptions(
-        maximum_concurrent_activity_work_items=2,
-        maximum_concurrent_orchestration_work_items=1,
-        maximum_thread_pool_workers=2,
-    )
-    worker = TaskHubGrpcWorker(concurrency_options=options)
+    worker = TaskHubGrpcWorker()
     stub = DummyStub()
 
     def dummy_orchestrator(req, stub, completionToken):
@@ -102,18 +97,12 @@ def dummy_activity(ctx, input):
 
 
 def test_worker_concurrency_sync():
-    # Use small concurrency to make test observable
-    options = ConcurrencyOptions(
-        maximum_concurrent_activity_work_items=2,
-        maximum_concurrent_orchestration_work_items=2,
-        maximum_thread_pool_workers=2,
-    )
-    worker = TaskHubGrpcWorker(concurrency_options=options)
+    """Test that all work items run to completion with no concurrency limits."""
+    worker = TaskHubGrpcWorker()
     worker.add_orchestrator(dummy_orchestrator)
     worker.add_activity(dummy_activity)
 
-    # Simulate submitting work items to the queues directly (bypassing gRPC)
-    # We'll use the internal _async_worker_manager for this test
+    # Simulate submitting work items directly to the internal _async_worker_manager
     manager = worker._async_worker_manager
     results = []
     lock = threading.Lock()
@@ -127,7 +116,7 @@ def test_worker_concurrency_sync():
 
         return fn
 
-    # Submit more work than concurrency allows
+    # Submit work items before the event loop starts (they will be buffered)
     for i in range(5):
         manager.submit_orchestration(make_work("orch", i))
         manager.submit_activity(make_work("act", i))
@@ -140,9 +129,6 @@ def test_worker_concurrency_sync():
     t.start()
     time.sleep(1.5)  # Let work process
     manager.shutdown()
-    # Unblock the consumers by putting dummy items in the queues
-    manager.activity_queue.put_nowait((lambda: None, (), {}))
-    manager.orchestration_queue.put_nowait((lambda: None, (), {}))
     t.join(timeout=2)
 
     # Check that all work items completed
