@@ -539,7 +539,7 @@ class TaskHubGrpcWorker:
                             )
                         elif work_item.HasField("activityRequest"):
                             self._async_worker_manager.submit_activity(
-                                self._execute_activity,
+                                self._execute_activity_async,
                                 work_item.activityRequest,
                                 stub,
                                 work_item.completionToken,
@@ -812,6 +812,65 @@ class TaskHubGrpcWorker:
 
             try:
                 stub.CompleteActivityTask(res)
+            except grpc.RpcError as rpc_error:  # type: ignore
+                self._handle_grpc_execution_error(rpc_error, "activity")
+            except Exception as ex:
+                self._logger.exception(
+                    f"Failed to deliver activity response for '{req.name}#{req.taskId}' of orchestration ID '{instance_id}' to sidecar: {ex}"
+                )
+
+    async def _execute_activity_async(
+        self,
+        req: pb.ActivityRequest,
+        stub: stubs.TaskHubSidecarServiceStub,
+        completionToken,
+    ):
+        """Execute an activity without blocking the event loop.
+
+        - Async activities (`async def`) are awaited directly on the worker loop.
+        - Sync activities (`def`) are executed in a dedicated thread per work item.
+        - gRPC completion calls are also offloaded so the loop stays responsive.
+        """
+        instance_id = req.orchestrationInstance.instanceId
+
+        if otel_tracer is not None:
+            span_context = otel_tracer.start_as_current_span(
+                name=f"activity: {req.name}",
+                context=otel_propagator.extract(
+                    carrier={"traceparent": req.parentTraceContext.traceParent}
+                ),
+                attributes={
+                    "durabletask.task.instance_id": instance_id,
+                    "durabletask.task.id": req.taskId,
+                    "durabletask.activity.name": req.name,
+                },
+            )
+        else:
+            span_context = contextlib.nullcontext()
+
+        with span_context:
+            try:
+                executor = _ActivityExecutor(self._registry, self._logger)
+                result = await executor.execute_async(
+                    instance_id, req.name, req.taskId, req.input.value
+                )
+                res = pb.ActivityResponse(
+                    instanceId=instance_id,
+                    taskId=req.taskId,
+                    result=ph.get_string_value(result),
+                    completionToken=completionToken,
+                )
+            except Exception as ex:
+                res = pb.ActivityResponse(
+                    instanceId=instance_id,
+                    taskId=req.taskId,
+                    failureDetails=ph.new_failure_details(ex),
+                    completionToken=completionToken,
+                )
+
+            try:
+                # Offload blocking gRPC completion to a dedicated thread.
+                await _AsyncWorkerManager._run_in_thread(stub.CompleteActivityTask, res)
             except grpc.RpcError as rpc_error:  # type: ignore
                 self._handle_grpc_execution_error(rpc_error, "activity")
             except Exception as ex:
@@ -1604,6 +1663,41 @@ class _ActivityExecutor:
         )
         return encoded_output
 
+    async def execute_async(
+        self,
+        orchestration_id: str,
+        name: str,
+        task_id: int,
+        encoded_input: Optional[str],
+    ) -> Optional[str]:
+        """Async-capable activity execution.
+
+        Supports both sync (`def`) and async (`async def`) activity callables.
+        """
+        self._logger.debug(f"{orchestration_id}/{task_id}: Executing activity '{name}'...")
+        fn = self._registry.get_activity(name)
+        if not fn:
+            raise ActivityNotRegisteredError(
+                f"Activity function named '{name}' was not registered!"
+            )
+
+        activity_input = shared.from_json(encoded_input) if encoded_input else None
+        ctx = task.ActivityContext(orchestration_id, task_id)
+
+        # Execute the activity function
+        activity_output = fn(ctx, activity_input)
+        if inspect.isawaitable(activity_output):
+            activity_output = await activity_output
+
+        encoded_output = (
+            shared.to_json(activity_output) if activity_output is not None else None
+        )
+        chars = len(encoded_output) if encoded_output else 0
+        self._logger.debug(
+            f"{orchestration_id}/{task_id}: Activity '{name}' completed successfully with {chars} char(s) of encoded output."
+        )
+        return encoded_output
+
 
 def _get_non_determinism_error(task_id: int, action_name: str) -> task.NonDeterminismError:
     return task.NonDeterminismError(
@@ -1770,7 +1864,9 @@ class _AsyncWorkerManager:
             else:
                 loop.call_soon_threadsafe(_safe_set_future_result, future, result)
 
-        threading.Thread(target=run).start()
+        threading.Thread(
+            target=run, name="DurableTaskSyncWorkItem", daemon=True
+        ).start()
         return await future
 
     def submit_activity(self, func, *args, **kwargs):
