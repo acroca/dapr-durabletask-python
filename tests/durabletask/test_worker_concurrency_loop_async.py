@@ -50,9 +50,8 @@ def test_worker_concurrency_loop_async():
         await asyncio.sleep(0.1)
         stub.CompleteActivityTask("ok")
 
-    # Patch the worker's _execute_orchestrator and _execute_activity
+    # Patch the worker's _execute_orchestrator (activity work is submitted directly)
     grpc_worker._execute_orchestrator = dummy_orchestrator
-    grpc_worker._execute_activity = dummy_activity
 
     orchestrator_requests = [DummyRequest("orchestrator", f"orch{i}") for i in range(3)]
     activity_requests = [DummyRequest("activity", f"act{i}") for i in range(4)]

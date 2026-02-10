@@ -3,6 +3,7 @@
 
 import json
 import logging
+import asyncio
 from typing import Any, Optional, Tuple
 
 from durabletask import task, worker
@@ -26,7 +27,9 @@ def test_activity_inputs():
 
     activity_input = "Hello, 世界!"
     executor, name = _get_activity_executor(test_activity)
-    result = executor.execute(TEST_INSTANCE_ID, name, TEST_TASK_ID, json.dumps(activity_input))
+    result = asyncio.run(
+        executor.execute_async(TEST_INSTANCE_ID, name, TEST_TASK_ID, json.dumps(activity_input))
+    )
     assert result is not None
 
     result_input, result_orchestration_id, result_task_id = json.loads(result)
@@ -43,7 +46,7 @@ def test_activity_not_registered():
 
     caught_exception: Optional[Exception] = None
     try:
-        executor.execute(TEST_INSTANCE_ID, "Bogus", TEST_TASK_ID, None)
+        asyncio.run(executor.execute_async(TEST_INSTANCE_ID, "Bogus", TEST_TASK_ID, None))
     except Exception as ex:
         caught_exception = ex
 

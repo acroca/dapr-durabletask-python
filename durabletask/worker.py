@@ -247,7 +247,7 @@ class TaskHubGrpcWorker:
         self._channel_options = channel_options
         self._stop_timeout = stop_timeout
         self._current_channel: Optional[grpc.Channel] = None  # Store channel reference for cleanup
-        self._stream_ready = threading.Event()
+        self._stream_ready = Event()
 
         # Determine the interceptors to use
         if interceptors is not None:
@@ -498,7 +498,7 @@ class TaskHubGrpcWorker:
                 # Daemon threads exit immediately when the main program exits, which prevents
                 # cleanup of gRPC channel resources and OTel interceptors. Non-daemon threads
                 # block shutdown until they complete, ensuring all resources are properly closed.
-                current_reader_thread = threading.Thread(
+                current_reader_thread = Thread(
                     target=stream_reader, daemon=False, name="StreamReader"
                 )
 
@@ -770,54 +770,6 @@ class TaskHubGrpcWorker:
             self._logger.exception(
                 f"Failed to deliver orchestrator response for '{req.instanceId}' to sidecar: {ex}"
             )
-
-    def _execute_activity(
-        self,
-        req: pb.ActivityRequest,
-        stub: stubs.TaskHubSidecarServiceStub,
-        completionToken,
-    ):
-        instance_id = req.orchestrationInstance.instanceId
-
-        if otel_tracer is not None:
-            span_context = otel_tracer.start_as_current_span(
-                name=f'activity: {req.name}',
-                context=otel_propagator.extract(carrier={"traceparent": req.parentTraceContext.traceParent}),
-                attributes={
-                    "durabletask.task.instance_id": instance_id,
-                    "durabletask.task.id": req.taskId,
-                    "durabletask.activity.name": req.name,
-                }
-            )
-        else:
-            span_context = contextlib.nullcontext()
-
-        with span_context:
-            try:
-                executor = _ActivityExecutor(self._registry, self._logger)
-                result = executor.execute(instance_id, req.name, req.taskId, req.input.value)
-                res = pb.ActivityResponse(
-                    instanceId=instance_id,
-                    taskId=req.taskId,
-                    result=ph.get_string_value(result),
-                    completionToken=completionToken,
-                )
-            except Exception as ex:
-                res = pb.ActivityResponse(
-                    instanceId=instance_id,
-                    taskId=req.taskId,
-                    failureDetails=ph.new_failure_details(ex),
-                    completionToken=completionToken,
-                )
-
-            try:
-                stub.CompleteActivityTask(res)
-            except grpc.RpcError as rpc_error:  # type: ignore
-                self._handle_grpc_execution_error(rpc_error, "activity")
-            except Exception as ex:
-                self._logger.exception(
-                    f"Failed to deliver activity response for '{req.name}#{req.taskId}' of orchestration ID '{instance_id}' to sidecar: {ex}"
-                )
 
     async def _execute_activity_async(
         self,
@@ -1635,34 +1587,6 @@ class _ActivityExecutor:
         self._registry = registry
         self._logger = logger
 
-    def execute(
-        self,
-        orchestration_id: str,
-        name: str,
-        task_id: int,
-        encoded_input: Optional[str],
-    ) -> Optional[str]:
-        """Executes an activity function and returns the serialized result, if any."""
-        self._logger.debug(f"{orchestration_id}/{task_id}: Executing activity '{name}'...")
-        fn = self._registry.get_activity(name)
-        if not fn:
-            raise ActivityNotRegisteredError(
-                f"Activity function named '{name}' was not registered!"
-            )
-
-        activity_input = shared.from_json(encoded_input) if encoded_input else None
-        ctx = task.ActivityContext(orchestration_id, task_id)
-
-        # Execute the activity function
-        activity_output = fn(ctx, activity_input)
-
-        encoded_output = shared.to_json(activity_output) if activity_output is not None else None
-        chars = len(encoded_output) if encoded_output else 0
-        self._logger.debug(
-            f"{orchestration_id}/{task_id}: Activity '{name}' completed successfully with {chars} char(s) of encoded output."
-        )
-        return encoded_output
-
     async def execute_async(
         self,
         orchestration_id: str,
@@ -1864,9 +1788,7 @@ class _AsyncWorkerManager:
             else:
                 loop.call_soon_threadsafe(_safe_set_future_result, future, result)
 
-        threading.Thread(
-            target=run, name="DurableTaskSyncWorkItem", daemon=True
-        ).start()
+        Thread(target=run, name="DurableTaskSyncWorkItem", daemon=True).start()
         return await future
 
     def submit_activity(self, func, *args, **kwargs):
